@@ -1,0 +1,1232 @@
+"""
+=============================================================================
+LTspice Circuit Netlist Generator
+=============================================================================
+Author      : Auto-generated for ML dataset use
+Description : Interactively generates LTspice .cir netlist files for
+              various analog circuit types. Supports normal and 'faulty'
+              variants to build datasets for fault-detection ML models.
+
+HOW TO RUN:
+    1. Make sure Python 3.7+ is installed.
+    2. Open a terminal / command prompt in this directory.
+    3. Run:  python ltspice_generator.py
+    4. Follow the on-screen prompts.
+    5. The .cir file will be saved in the current directory.
+    6. If LTspice is installed you can let the script open it automatically.
+
+ADDING NEW CIRCUIT TYPES:
+    - Add a new key to CIRCUIT_TEMPLATES dict below.
+    - Write a corresponding builder function that returns a netlist string.
+    - Register it in CIRCUIT_BUILDERS dict.
+=============================================================================
+"""
+
+import os
+import sys
+from typing import Optional, Callable
+import subprocess
+import re
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# 1. VALUE PARSER
+#    Converts human-readable component values (e.g. "1k", "10mH", "1uF")
+#    to LTspice-compatible strings.
+# ---------------------------------------------------------------------------
+
+# Suffix → LTspice suffix mapping
+_SUFFIX_MAP = {
+    "t":  "T",   # Tera
+    "g":  "G",   # Giga
+    "meg": "MEG", # Mega (LTspice uses MEG not M for 1e6)
+    "k":  "k",   # kilo
+    "m":  "m",   # milli   (lowercase in LTspice)
+    "u":  "u",   # micro
+    "n":  "n",   # nano
+    "p":  "p",   # pico
+    "f":  "f",   # femto
+    # Unit aliases (H, F, etc.) are stripped; LTspice infers them from component letter
+    "h":  "",    # Henry   – unit, not a multiplier
+    "f_": "",    # Farad   – unit (avoid collision with "f" = femto)
+}
+
+# Regex: number optionally followed by a suffix/unit
+_VALUE_RE = re.compile(
+    r"^\s*([+-]?[0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)"
+    r"\s*(T|G|MEG|Meg|meg|K|k|M|m|u|µ|U|n|N|p|P|f|F|mH|uH|nH|mF|uF|nF|pF|H|h)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_value(raw: str) -> str:
+    """
+    Parse a user-supplied component value like '1k', '10mH', '1uF', '5V'
+    and return an LTspice-compatible string (e.g. '1k', '10m', '1u').
+
+    Raises ValueError for unparseable inputs.
+    """
+    raw = raw.strip()
+    m = _VALUE_RE.match(raw)
+    if not m:
+        raise ValueError(f"Cannot parse value: '{raw}'")
+
+    num, suffix = m.group(1), (m.group(2) or "").lower()
+
+    # Strip unit letters that only indicate the physical quantity (H, F, V, A, Ω)
+    # but keep multiplier suffixes
+    unit_only = {"h", "f", "v", "a", "ω", "ohm"}  # pure units
+    multiplier_map = {
+        "t": "T", "g": "G", "meg": "MEG", "k": "k",
+        "m": "m", "mh": "m", "mf": "m",   # milli-Henry / milli-Farad
+        "u": "u", "µ": "u", "uh": "u", "uf": "u",
+        "n": "n", "nh": "n", "nf": "n",
+        "p": "p", "pf": "p",
+    }
+
+    ltspice_suffix = multiplier_map.get(suffix, "")
+    return f"{num}{ltspice_suffix}"
+
+
+def prompt_value(prompt_text: str, default: str = None) -> str:
+    """Prompt the user for a component value; returns LTspice-ready string."""
+    hint = f" [default: {default}]" if default else ""
+    while True:
+        raw = input(f"  {prompt_text}{hint}: ").strip()
+        if raw == "" and default is not None:
+            raw = default
+        try:
+            return parse_value(raw)
+        except ValueError as exc:
+            print(f"    [!] {exc}  - try again (e.g. 1k, 10m, 470n)")
+
+
+def prompt_int(prompt_text: str, default: int = None, lo: int = None, hi: int = None) -> int:
+    """Prompt the user for an integer, with optional bounds."""
+    hint = f" [default: {default}]" if default is not None else ""
+    while True:
+        raw = input(f"  {prompt_text}{hint}: ").strip()
+        if raw == "" and default is not None:
+            return default
+        try:
+            val = int(raw)
+            if lo is not None and val < lo:
+                raise ValueError(f"Must be ≥ {lo}")
+            if hi is not None and val > hi:
+                raise ValueError(f"Must be ≤ {hi}")
+            return val
+        except ValueError as exc:
+            print(f"    [!] {exc}  - try again")
+
+
+def prompt_choice(prompt_text: str, choices: list, default: int = 1) -> str:
+    """Display a numbered menu and return the chosen string."""
+    print(f"\n  {prompt_text}")
+    for idx, choice in enumerate(choices, start=1):
+        marker = " (default)" if idx == default else ""
+        print(f"    [{idx}] {choice}{marker}")
+    while True:
+        raw = input("  Enter number: ").strip()
+        if raw == "":
+            return choices[default - 1]
+        try:
+            idx = int(raw)
+            if 1 <= idx <= len(choices):
+                return choices[idx - 1]
+        except ValueError:
+            pass
+        print(f"    [!] Please enter a number between 1 and {len(choices)}")
+
+
+# ---------------------------------------------------------------------------
+# 2. SIMULATION COMMAND HELPERS
+# ---------------------------------------------------------------------------
+
+def build_tran_cmd(stop_time_s: float, step_time_s: float = None) -> str:
+    """Build a .tran simulation command string."""
+    if step_time_s is None:
+        step_time_s = stop_time_s / 1000
+    return f".tran {_fmt_time(step_time_s)} {_fmt_time(stop_time_s)}"
+
+
+def build_ac_cmd(points_per_decade: int = 100,
+                 f_start: str = "1", f_stop: str = "1Meg") -> str:
+    """Build a .ac simulation command string."""
+    return f".ac dec {points_per_decade} {f_start} {f_stop}"
+
+
+def _fmt_time(seconds: float) -> str:
+    """Format a time value in seconds to a compact LTspice string."""
+    if seconds >= 1:
+        return f"{seconds}s"
+    elif seconds >= 1e-3:
+        return f"{seconds * 1e3:.6g}ms"
+    elif seconds >= 1e-6:
+        return f"{seconds * 1e6:.6g}us"
+    else:
+        return f"{seconds * 1e9:.6g}ns"
+
+
+# ---------------------------------------------------------------------------
+# 3. NETLIST HEADER / FOOTER
+# ---------------------------------------------------------------------------
+
+def netlist_header(title: str) -> str:
+    return f"* {title}\n* Generated by LTspice Circuit Generator\n"
+
+
+def netlist_footer() -> str:
+    return "\n.backanno\n.end\n"
+
+
+# ---------------------------------------------------------------------------
+# 4. CIRCUIT BUILDER FUNCTIONS
+#    Each function collects parameters interactively and returns a complete
+#    netlist string ready to be saved as a .cir file.
+# ---------------------------------------------------------------------------
+
+# ------------------------------------------------------------------
+# 4a. RC Low-Pass Filter
+# ------------------------------------------------------------------
+def build_rc_lowpass() -> tuple[str, str, str]:
+    """
+    RC Low-Pass Filter topology:
+
+        Vin ──[R]──┬── Vout
+                   │
+                  [C]
+                   │
+                  GND
+    """
+    print("\n  ── RC Low-Pass Filter ──")
+    r  = prompt_value("Resistance R",  default="1k")
+    c  = prompt_value("Capacitance C", default="1u")
+    va = prompt_value("Source amplitude (V)", default="5")
+    freq = prompt_value("Source frequency (Hz)", default="1k")
+
+    # Determine a sensible transient stop time: 10 periods
+    try:
+        num_freq = float(re.match(r"[0-9.eE+\-]+", freq).group())
+        if freq.endswith("k") or freq.endswith("K"):
+            num_freq *= 1e3
+        stop = 10 / num_freq
+    except Exception:
+        stop = 10e-3
+
+    tran_cmd = build_tran_cmd(stop)
+    lines = [
+        netlist_header("RC Low-Pass Filter"),
+        f"V1 Vin 0 SINE(0 {va} {freq})",
+        f"R1 Vin Vout {r}",
+        f"C1 Vout 0 {c}",
+        f"",
+        tran_cmd,
+        netlist_footer(),
+    ]
+    asc = make_asc_rc_lowpass(r, c, va, freq, tran_cmd)
+    return "rc_lowpass", "\n".join(lines), asc
+
+
+# ------------------------------------------------------------------
+# 4b. RC High-Pass Filter
+# ------------------------------------------------------------------
+def build_rc_highpass() -> tuple[str, str, str]:
+    """
+    RC High-Pass Filter topology:
+
+        Vin ──[C]──┬── Vout
+                   │
+                  [R]
+                   │
+                  GND
+    """
+    print("\n  ── RC High-Pass Filter ──")
+    r  = prompt_value("Resistance R",  default="1k")
+    c  = prompt_value("Capacitance C", default="1u")
+    va = prompt_value("Source amplitude (V)", default="5")
+    freq = prompt_value("Source frequency (Hz)", default="1k")
+
+    try:
+        num_freq = float(re.match(r"[0-9.eE+\-]+", freq).group())
+        if freq.endswith("k") or freq.endswith("K"):
+            num_freq *= 1e3
+        stop = 10 / num_freq
+    except Exception:
+        stop = 10e-3
+
+    tran_cmd = build_tran_cmd(stop)
+    lines = [
+        netlist_header("RC High-Pass Filter"),
+        f"V1 Vin 0 SINE(0 {va} {freq})",
+        f"C1 Vin Vout {c}",
+        f"R1 Vout 0 {r}",
+        f"",
+        tran_cmd,
+        netlist_footer(),
+    ]
+    asc = make_asc_rc_highpass(r, c, va, freq, tran_cmd)
+    return "rc_highpass", "\n".join(lines), asc
+
+
+# ------------------------------------------------------------------
+# 4c. RLC Band-Pass Filter
+# ------------------------------------------------------------------
+def build_rlc_bandpass() -> tuple[str, str, str]:
+    """
+    Series RLC Band-Pass Filter:
+
+        Vin ──[R]──[L]──┬── Vout
+                        │
+                       [C]
+                        │
+                       GND
+    """
+    print("\n  ── RLC Band-Pass Filter ──")
+    r  = prompt_value("Resistance R",   default="100")
+    l  = prompt_value("Inductance L",   default="10m")
+    c  = prompt_value("Capacitance C",  default="1u")
+    va = prompt_value("Source amplitude (V)", default="5")
+
+    ac_cmd = build_ac_cmd(f_start="10", f_stop="1Meg")
+    lines = [
+        netlist_header("RLC Band-Pass Filter"),
+        f"V1 Vin 0 AC {va} SIN(0 {va} 1k)",
+        f"R1 Vin N1   {r}",
+        f"L1 N1  Vout {l}",
+        f"C1 Vout 0   {c}",
+        f"",
+        ac_cmd,
+        netlist_footer(),
+    ]
+    asc = make_asc_rlc_bandpass(r, l, c, va, ac_cmd)
+    return "rlc_bandpass", "\n".join(lines), asc
+
+
+# ------------------------------------------------------------------
+# 4d. RLC Band-Stop (Notch) Filter
+# ------------------------------------------------------------------
+def build_rlc_bandstop() -> tuple[str, str, str]:
+    """
+    RLC Band-Stop (Notch) Filter – parallel LC in series path:
+
+        Vin ──[R1]──N1──┬──[L1]──┬── Vout
+                        └──[C1]──┘
+                                  │
+                                [Rload]
+                                  │
+                                 GND
+    """
+    print("\n  ── RLC Band-Stop (Notch) Filter ──")
+    r  = prompt_value("Series Resistance R",  default="1k")
+    l  = prompt_value("Inductance L",         default="10m")
+    c  = prompt_value("Capacitance C",        default="1u")
+    rl = prompt_value("Load Resistance Rload",default="10k")
+    va = prompt_value("Source amplitude (V)", default="5")
+
+    ac_cmd = build_ac_cmd(f_start="10", f_stop="1Meg")
+    lines = [
+        netlist_header("RLC Band-Stop (Notch) Filter"),
+        f"V1 Vin 0 AC {va} SIN(0 {va} 1k)",
+        f"R1  Vin  N1   {r}",
+        f"L1  N1   Vout {l}",
+        f"C1  N1   Vout {c}",   # L and C in parallel across output
+        f"Rl  Vout 0    {rl}",
+        f"",
+        ac_cmd,
+        netlist_footer(),
+    ]
+    asc = make_asc_rlc_bandstop(r, l, c, rl, va, ac_cmd)
+    return "rlc_bandstop", "\n".join(lines), asc
+
+
+# ------------------------------------------------------------------
+# 4e. Voltage Divider
+# ------------------------------------------------------------------
+def build_voltage_divider() -> tuple[str, str, str]:
+    """
+    Resistive Voltage Divider:
+
+        Vin ──[R1]──┬── Vout
+                    │
+                   [R2]
+                    │
+                   GND
+    """
+    print("\n  ── Voltage Divider ──")
+    r1 = prompt_value("R1 (top resistor)",    default="10k")
+    r2 = prompt_value("R2 (bottom resistor)", default="10k")
+    vd = prompt_value("DC supply voltage (V)", default="5")
+
+    lines = [
+        netlist_header("Voltage Divider"),
+        f"V1 Vin 0 DC {vd}",
+        f"R1 Vin Vout {r1}",
+        f"R2 Vout 0   {r2}",
+        f"",
+        f".op",
+        netlist_footer(),
+    ]
+    asc = make_asc_voltage_divider(r1, r2, vd)
+    return "voltage_divider", "\n".join(lines), asc
+
+
+# ------------------------------------------------------------------
+# 4f. Series RLC Circuit
+# ------------------------------------------------------------------
+def build_series_rlc() -> tuple[str, str, str]:
+    """
+    Series RLC Circuit:
+
+        Vin ──[R]──[L]──[C]── GND
+                         │
+                        Vout (across C)
+    """
+    print("\n  ── Series RLC Circuit ──")
+    r  = prompt_value("Resistance R",  default="10")
+    l  = prompt_value("Inductance L",  default="10m")
+    c  = prompt_value("Capacitance C", default="100u")
+    va = prompt_value("Source amplitude (V)", default="5")
+    freq = prompt_value("Source frequency (Hz)", default="1k")
+
+    try:
+        num_freq = float(re.match(r"[0-9.eE+\-]+", freq).group())
+        if freq.endswith("k") or freq.endswith("K"):
+            num_freq *= 1e3
+        stop = 20 / num_freq
+    except Exception:
+        stop = 20e-3
+
+    tran_cmd = build_tran_cmd(stop)
+    lines = [
+        netlist_header("Series RLC Circuit"),
+        f"V1 Vin 0 SINE(0 {va} {freq})",
+        f"R1 Vin N1   {r}",
+        f"L1 N1  N2   {l}",
+        f"C1 N2  0    {c}",
+        f"",
+        f"* Vout is measured across the capacitor C1 (node N2)",
+        tran_cmd,
+        netlist_footer(),
+    ]
+    asc = make_asc_series_rlc(r, l, c, va, freq, tran_cmd)
+    return "series_rlc", "\n".join(lines), asc
+
+
+# ------------------------------------------------------------------
+# 4g. Parallel RLC Circuit
+# ------------------------------------------------------------------
+def build_parallel_rlc() -> tuple[str, str, str]:
+    """
+    Parallel RLC Circuit (current source driving parallel RLC):
+
+        Iin ──┬──[R]──┬── GND
+              ├──[L]──┤
+              ├──[C]──┤
+             Vout    GND
+    """
+    print("\n  ── Parallel RLC Circuit ──")
+    r  = prompt_value("Resistance R",  default="1k")
+    l  = prompt_value("Inductance L",  default="10m")
+    c  = prompt_value("Capacitance C", default="1u")
+    ia = prompt_value("Current source amplitude (A)", default="1m")
+    freq = prompt_value("Source frequency (Hz)", default="1k")
+
+    try:
+        num_freq = float(re.match(r"[0-9.eE+\-]+", freq).group())
+        if freq.endswith("k") or freq.endswith("K"):
+            num_freq *= 1e3
+        stop = 10 / num_freq
+    except Exception:
+        stop = 10e-3
+
+    tran_cmd = build_tran_cmd(stop)
+    lines = [
+        netlist_header("Parallel RLC Circuit"),
+        f"I1 0 Vout SINE(0 {ia} {freq})",
+        f"R1 Vout 0 {r}",
+        f"L1 Vout 0 {l}",
+        f"C1 Vout 0 {c}",
+        f"",
+        tran_cmd,
+        netlist_footer(),
+    ]
+    asc = make_asc_parallel_rlc(r, l, c, ia, freq, tran_cmd)
+    return "parallel_rlc", "\n".join(lines), asc
+
+
+# ------------------------------------------------------------------
+# 4h. Custom Circuit (user provides raw netlist lines)
+# ------------------------------------------------------------------
+def build_custom() -> tuple[str, str, str]:
+    """
+    Let the user type in arbitrary netlist statements.
+    One line at a time; blank line finishes entry.
+    """
+    print("\n  ── Custom Circuit ──")
+    print("  Enter netlist lines one at a time.")
+    print("  Press Enter on a blank line when done.\n")
+    print("  Example lines:")
+    print("    V1 Vin 0 DC 5")
+    print("    R1 Vin Vout 1k")
+    print("    C1 Vout 0 1u")
+    print("    .tran 1us 10ms\n")
+
+    user_lines = []
+    while True:
+        line = input("  > ")
+        if line.strip() == "":
+            break
+        user_lines.append(line)
+
+    # Give it a title
+    title = input("\n  Circuit title (used as filename): ").strip() or "custom_circuit"
+    safe_name = re.sub(r"[^\w\-]", "_", title).lower()
+
+    lines = [
+        netlist_header(title),
+    ] + user_lines + [
+        netlist_footer(),
+    ]
+    return safe_name, "\n".join(lines), ""  # no ASC for custom circuits
+
+
+# ---------------------------------------------------------------------------
+# 4i. ASC SCHEMATIC TEMPLATE GENERATORS
+#
+# Coordinate system (derived from real LTspice .asc files, 16-unit grid):
+#   voltage / current R180 at (sx, sy):
+#       circuit pin → (sx,  sy-80),  GND pin → (sx,  sy+64)
+#   res / cap / ind  R90  at (sx, sy)  [horizontal]:
+#       left pin    → (sx-64, sy+16),  right pin → (sx+160, sy+16)
+#   res / cap / ind  R0   at (sx, sy)  [vertical / shunt]:
+#       top pin     → (sx+16, sy-48),  bottom pin → (sx+16, sy+96)
+#       body top    → sy,              body bottom → sy+64
+# ---------------------------------------------------------------------------
+
+def _v1_sine(va: str, freq: str) -> str:
+    """Voltage source block – SINE stimulus (R180 orientation, x=16)."""
+    return (
+        "SYMBOL voltage 16 208 R180\n"
+        "WINDOW 0 24 96 Left 2\n"
+        "WINDOW 3 24 16 Left 2\n"
+        "SYMATTR InstName V1\n"
+        f"SYMATTR Value SINE(0 {va} {freq})\n"
+    )
+
+
+def _v1_dc(vd: str) -> str:
+    """Voltage source block – DC stimulus (R180 orientation, x=16)."""
+    return (
+        "SYMBOL voltage 16 208 R180\n"
+        "WINDOW 0 24 96 Left 2\n"
+        "WINDOW 3 24 16 Left 2\n"
+        "SYMATTR InstName V1\n"
+        f"SYMATTR Value DC {vd}\n"
+    )
+
+
+def _v1_ac(va: str) -> str:
+    """Voltage source block – AC+SIN stimulus (R180 orientation, x=16)."""
+    return (
+        "SYMBOL voltage 16 208 R180\n"
+        "WINDOW 0 24 96 Left 2\n"
+        "WINDOW 3 24 16 Left 2\n"
+        "SYMATTR InstName V1\n"
+        f"SYMATTR Value AC {va} SIN(0 {va} 1k)\n"
+    )
+
+
+# Standard left-column V1 wires (x=16, circuit bus at y=128, GND at y=272)
+_V1_WIRES = (
+    "WIRE 16 256 16 128\n"   # wire occupying V1 body space
+    "WIRE 16 272 16 256\n"   # V1 GND lead
+    "FLAG 16 272 0\n"         # global GND
+    "FLAG 16 128 Vin\n"       # Vin net label on left bus
+)
+
+
+def make_asc_rc_lowpass(r: str, c: str, va: str, freq: str, tran_cmd: str) -> str:
+    """
+    RC Low-Pass Filter schematic.
+    V1(R180,x=16) → R1(R90, bus y=128) → C1(R0, shunt to GND)
+    """
+    return (
+        "Version 4\nSHEET 1 880 680\n"
+        # wires: horizontal bus + shunt cap leads
+        "WIRE 96 128 16 128\n"
+        "WIRE 240 128 96 128\n"
+        "WIRE 240 176 240 128\n"   # cap top lead
+        "WIRE 240 272 240 240\n"   # cap bottom lead
+        + _V1_WIRES
+        + "FLAG 240 272 0\n"
+        "FLAG 240 128 Vout\n"
+        + _v1_sine(va, freq)
+        + "SYMBOL res 80 112 R90\n"
+        "WINDOW 0 0 56 VBottom 2\n"
+        "WINDOW 3 32 56 VTop 2\n"
+        "SYMATTR InstName R1\n"
+        f"SYMATTR Value {r}\n"
+        "SYMBOL cap 224 176 R0\n"
+        "SYMATTR InstName C1\n"
+        f"SYMATTR Value {c}\n"
+        f"TEXT -4 304 Left 2 !{tran_cmd}\n"
+        "TEXT -4 328 Left 2 !.backanno\n"
+    )
+
+
+def make_asc_rc_highpass(r: str, c: str, va: str, freq: str, tran_cmd: str) -> str:
+    """
+    RC High-Pass Filter schematic.
+    V1 → C1(R90, series) → R1(R0, shunt to GND)
+    """
+    return (
+        "Version 4\nSHEET 1 880 680\n"
+        "WIRE 96 128 16 128\n"
+        "WIRE 240 128 96 128\n"
+        "WIRE 240 176 240 128\n"   # res top lead
+        "WIRE 240 272 240 240\n"   # res bottom lead
+        + _V1_WIRES
+        + "FLAG 240 272 0\n"
+        "FLAG 240 128 Vout\n"
+        + _v1_sine(va, freq)
+        + "SYMBOL cap 80 112 R90\n"
+        "WINDOW 0 0 56 VBottom 2\n"
+        "WINDOW 3 32 56 VTop 2\n"
+        "SYMATTR InstName C1\n"
+        f"SYMATTR Value {c}\n"
+        "SYMBOL res 224 176 R0\n"
+        "WINDOW 0 38 -25 Left 2\n"
+        "WINDOW 3 38 50 Left 2\n"
+        "SYMATTR InstName R1\n"
+        f"SYMATTR Value {r}\n"
+        f"TEXT -4 304 Left 2 !{tran_cmd}\n"
+        "TEXT -4 328 Left 2 !.backanno\n"
+    )
+
+
+def make_asc_rlc_bandpass(r: str, l: str, c: str, va: str, ac_cmd: str) -> str:
+    """
+    RLC Band-Pass Filter schematic.
+    V1 → R1(R90) → L1(R90) → Vout, C1(R0) shunt to GND.
+    Sheet extended to 560 px wide.
+    R1 R90 at (80,112):  pins (16,128)↔(240,128)
+    L1 R90 at (304,112): pins (240,128)↔(464,128)
+    C1 R0  at (448,176): pins (464,128)↔(464,272)
+    """
+    return (
+        "Version 4\nSHEET 1 560 680\n"
+        "WIRE 240 128 16 128\n"
+        "WIRE 464 128 240 128\n"
+        "WIRE 464 176 464 128\n"   # C1 top lead
+        "WIRE 464 272 464 240\n"   # C1 bottom lead
+        + _V1_WIRES
+        + "FLAG 464 272 0\n"
+        "FLAG 240 128 N1\n"
+        "FLAG 464 128 Vout\n"
+        + _v1_ac(va)
+        + "SYMBOL res 80 112 R90\n"
+        "WINDOW 0 0 56 VBottom 2\n"
+        "WINDOW 3 32 56 VTop 2\n"
+        "SYMATTR InstName R1\n"
+        f"SYMATTR Value {r}\n"
+        "SYMBOL ind 304 112 R90\n"
+        "WINDOW 0 -14 -40 Left 2\n"
+        "WINDOW 3 -19 16 Left 2\n"
+        "SYMATTR InstName L1\n"
+        f"SYMATTR Value {l}\n"
+        "SYMBOL cap 448 176 R0\n"
+        "SYMATTR InstName C1\n"
+        f"SYMATTR Value {c}\n"
+        f"TEXT -4 304 Left 2 !{ac_cmd}\n"
+        "TEXT -4 328 Left 2 !.backanno\n"
+    )
+
+
+def make_asc_rlc_bandstop(r: str, l: str, c: str, rl: str, va: str, ac_cmd: str) -> str:
+    """
+    RLC Band-Stop schematic.
+    V1 → R1(series) → N1, L1‖C1 (parallel tank) → Vout, Rl(shunt) → GND.
+    R1 R90  at (80,112):  (16,128)↔(240,128)
+    L1 R0   at (224,176): (240,128)↔(240,272)   vertical
+    C1 R0   at (352,176): (368,128)↔(368,272)   vertical, parallel with L1
+    Rl R0   at (352,320): (368,272)↔(368,416)   Rload to GND
+    """
+    return (
+        "Version 4\nSHEET 1 560 480\n"
+        # series bus and N1→C1 branch
+        "WIRE 240 128 16 128\n"   # Vin → R1 → N1
+        "WIRE 368 128 240 128\n"  # N1 → C1 top
+        # L1 vertical wires
+        "WIRE 240 176 240 128\n"  # L1 top lead
+        "WIRE 240 272 240 240\n"  # L1 bottom lead
+        # C1 vertical wires
+        "WIRE 368 176 368 128\n"  # C1 top lead
+        "WIRE 368 272 368 240\n"  # C1 bottom lead
+        # Vout bus (L1 bottom ↔ C1 bottom)
+        "WIRE 368 272 240 272\n"
+        # Rload leads
+        "WIRE 368 320 368 272\n"  # Rload top lead
+        "WIRE 368 416 368 384\n" # Rload bottom lead
+        + _V1_WIRES
+        + "FLAG 368 416 0\n"
+        "FLAG 240 128 N1\n"       # N1 label at junction
+        "FLAG 304 272 Vout\n"     # Vout label on shared bottom bus
+        + _v1_ac(va)
+        + "SYMBOL res 80 112 R90\n"
+        "WINDOW 0 0 56 VBottom 2\n"
+        "WINDOW 3 32 56 VTop 2\n"
+        "SYMATTR InstName R1\n"
+        f"SYMATTR Value {r}\n"
+        "SYMBOL ind 224 176 R0\n"
+        "WINDOW 0 -14 -40 Left 2\n"
+        "WINDOW 3 -19 16 Left 2\n"
+        "SYMATTR InstName L1\n"
+        f"SYMATTR Value {l}\n"
+        "SYMBOL cap 352 176 R0\n"
+        "SYMATTR InstName C1\n"
+        f"SYMATTR Value {c}\n"
+        "SYMBOL res 352 320 R0\n"  # Rload: top=(368,272), bottom=(368,416)
+        "WINDOW 0 38 -25 Left 2\n"
+        "WINDOW 3 38 50 Left 2\n"
+        "SYMATTR InstName Rl\n"
+        f"SYMATTR Value {rl}\n"
+        f"TEXT -4 440 Left 2 !{ac_cmd}\n"
+        "TEXT -4 464 Left 2 !.backanno\n"
+    )
+
+
+def make_asc_voltage_divider(r1: str, r2: str, vd: str) -> str:
+    """
+    Resistive Voltage Divider schematic.
+    V1(DC) on left. R1(R0) + R2(R0) stacked vertically on the right.
+    V1 R180 at (16,208):  (16,128) Vin, (16,272) GND
+    R1 R0   at (112,176): top=(128,128), bottom=(128,272)  [= Vout]
+    R2 R0   at (112,320): top=(128,272), bottom=(128,416)
+    """
+    return (
+        "Version 4\nSHEET 1 440 560\n"
+        "WIRE 128 128 16 128\n"   # Vin bus
+        # R1 leads
+        "WIRE 128 176 128 128\n"  # R1 top lead
+        "WIRE 128 272 128 240\n"  # R1 bottom lead / Vout
+        # R2 leads
+        "WIRE 128 320 128 272\n"  # R2 top lead
+        "WIRE 128 416 128 384\n" # R2 bottom lead
+        + _V1_WIRES
+        + "FLAG 128 416 0\n"       # GND at bottom of R2
+        "FLAG 128 272 Vout\n"     # Vout at junction
+        + _v1_dc(vd)
+        + "SYMBOL res 112 176 R0\n"
+        "WINDOW 0 38 -25 Left 2\n"
+        "WINDOW 3 38 50 Left 2\n"
+        "SYMATTR InstName R1\n"
+        f"SYMATTR Value {r1}\n"
+        "SYMBOL res 112 320 R0\n"
+        "WINDOW 0 38 -25 Left 2\n"
+        "WINDOW 3 38 50 Left 2\n"
+        "SYMATTR InstName R2\n"
+        f"SYMATTR Value {r2}\n"
+        "TEXT -4 440 Left 2 !.op\n"
+        "TEXT -4 464 Left 2 !.backanno\n"
+    )
+
+
+def make_asc_series_rlc(r: str, l: str, c: str, va: str, freq: str, tran_cmd: str) -> str:
+    """
+    Series RLC Circuit schematic. Output (Vout=N2) is across C1.
+    Same layout as band-pass but Vout relabelled to match .cir (V(N2)).
+    R1 R90 at (80,112):  (16,128)↔(240,128)
+    L1 R90 at (304,112): (240,128)↔(464,128)
+    C1 R0  at (448,176): (464,128)↔(464,272)  shunt; Vout = top of C1
+    """
+    return (
+        "Version 4\nSHEET 1 560 680\n"
+        "WIRE 240 128 16 128\n"
+        "WIRE 464 128 240 128\n"
+        "WIRE 464 176 464 128\n"   # C1 top lead
+        "WIRE 464 272 464 240\n"   # C1 bottom lead
+        + _V1_WIRES
+        + "FLAG 464 272 0\n"
+        "FLAG 240 128 N1\n"
+        "FLAG 464 128 N2\n"         # N2 = Vout (across C1)
+        + _v1_sine(va, freq)
+        + "SYMBOL res 80 112 R90\n"
+        "WINDOW 0 0 56 VBottom 2\n"
+        "WINDOW 3 32 56 VTop 2\n"
+        "SYMATTR InstName R1\n"
+        f"SYMATTR Value {r}\n"
+        "SYMBOL ind 304 112 R90\n"
+        "WINDOW 0 -14 -40 Left 2\n"
+        "WINDOW 3 -19 16 Left 2\n"
+        "SYMATTR InstName L1\n"
+        f"SYMATTR Value {l}\n"
+        "SYMBOL cap 448 176 R0\n"
+        "SYMATTR InstName C1\n"
+        f"SYMATTR Value {c}\n"
+        f"TEXT -4 304 Left 2 !{tran_cmd}\n"
+        "TEXT -4 328 Left 2 !.backanno\n"
+    )
+
+
+def make_asc_parallel_rlc(r: str, l: str, c: str, ia: str, freq: str, tran_cmd: str) -> str:
+    """
+    Parallel RLC Circuit schematic (current source + 3 shunt branches).
+    I1 (current) R0 at (16,208): top=(16,128)=Vout, bottom=(16,272)=GND
+    R1 R0 at (112,176): (128,128)↔(128,272)
+    L1 R0 at (240,176): (256,128)↔(256,272)
+    C1 R0 at (368,176): (384,128)↔(384,272)
+    """
+    return (
+        "Version 4\nSHEET 1 480 680\n"
+        # Vout bus at y=128
+        "WIRE 128 128 16 128\n"
+        "WIRE 256 128 128 128\n"
+        "WIRE 384 128 256 128\n"
+        # GND bus at y=272
+        "WIRE 128 272 16 272\n"
+        "WIRE 256 272 128 272\n"
+        "WIRE 384 272 256 272\n"
+        # R1 leads
+        "WIRE 128 176 128 128\n"
+        "WIRE 128 272 128 240\n"
+        # L1 leads
+        "WIRE 256 176 256 128\n"
+        "WIRE 256 272 256 240\n"
+        # C1 leads
+        "WIRE 384 176 384 128\n"
+        "WIRE 384 272 384 240\n"
+        # I1 wires (same body-space wires as V1)
+        "WIRE 16 256 16 128\n"
+        "WIRE 16 272 16 256\n"
+        "FLAG 16 272 0\n"
+        "FLAG 16 128 Vout\n"
+        # Current source symbol (positive pin at top = Vout)
+        "SYMBOL current 16 208 R0\n"
+        "WINDOW 0 -29 -60 Left 2\n"
+        "WINDOW 3 -84 16 Left 2\n"
+        "SYMATTR InstName I1\n"
+        f"SYMATTR Value SINE(0 {ia} {freq})\n"
+        "SYMBOL res 112 176 R0\n"
+        "WINDOW 0 38 -25 Left 2\n"
+        "WINDOW 3 38 50 Left 2\n"
+        "SYMATTR InstName R1\n"
+        f"SYMATTR Value {r}\n"
+        "SYMBOL ind 240 176 R0\n"
+        "WINDOW 0 -14 -40 Left 2\n"
+        "WINDOW 3 -19 16 Left 2\n"
+        "SYMATTR InstName L1\n"
+        f"SYMATTR Value {l}\n"
+        "SYMBOL cap 368 176 R0\n"
+        "SYMATTR InstName C1\n"
+        f"SYMATTR Value {c}\n"
+        f"TEXT -4 304 Left 2 !{tran_cmd}\n"
+        "TEXT -4 328 Left 2 !.backanno\n"
+    )
+
+
+# ===========================================================================
+# HOW TO ADD A NEW CIRCUIT — follow these 3 steps:
+#
+#   STEP 1: Write a builder function (returns tuple[str, str, str])
+#           ↳ (file_name_slug, netlist_string, asc_string)
+#           ↳ Use prompt_value() / prompt_int() / prompt_choice() for inputs
+#           ↳ Call build_tran_cmd() or build_ac_cmd() for the sim command
+#           ↳ Wrap everything with netlist_header() + netlist_footer()
+#
+#   STEP 2: Write a make_asc_*() function that returns the .asc text
+#           ↳ Use FLAG for net labels (Vin, Vout, GND=0)
+#           ↳ Use WIRE for connections, SYMBOL for components
+#           ↳ Use TEXT with leading '!' for directives (.tran, .backanno)
+#           ↳ Return "" if you don't need schematic output
+#
+#   STEP 3: Add one line to CIRCUIT_BUILDERS dict at the bottom:
+#           "My Circuit Name": build_my_circuit,
+#
+# ── EXAMPLE: Half-Wave Rectifier added below ─────────────────────────────
+# ===========================================================================
+
+
+# ------------------------------------------------------------------
+# 4j. Half-Wave Rectifier  ← EXAMPLE NEW CIRCUIT
+# ------------------------------------------------------------------
+def build_half_wave_rectifier() -> tuple[str, str, str]:
+    """
+    Half-Wave Rectifier topology:
+
+        Vin ──[D1]──┬── Vout
+                    │
+                   [RL]   (load resistor)
+                    │
+                   GND
+
+    A diode passes only the positive half-cycle of the AC input.
+    """
+    print("\n  ── Half-Wave Rectifier ──")
+    va   = prompt_value("Source amplitude (V)",       default="5")
+    freq = prompt_value("Source frequency (Hz)",       default="50")
+    rl   = prompt_value("Load resistance RL",          default="1k")
+
+    # Diode model choice
+    diode = prompt_choice(
+        "Diode model:",
+        ["1N4148 (signal)", "1N4007 (power)", "Ideal (no drops)"],
+        default=1,
+    )
+    diode_model_name = {"1N4148 (signal)": "1N4148",
+                        "1N4007 (power)":  "1N4007",
+                        "Ideal (no drops)": "DIDEAL"}[diode]
+
+    # Model lines (LTspice built-in for 1N4148 / 1N4007; custom for ideal)
+    model_lines = {
+        "1N4148":  ".model 1N4148 D(Is=2.52n Rs=0.568 N=1.752 Cjo=4p M=0.4 tt=20n)",
+        "1N4007":  ".model 1N4007 D(Is=76.9p Rs=0.642 N=1.45  Cjo=26.5p M=0.333 tt=4.32u)",
+        "DIDEAL":  ".model DIDEAL D(Ron=0.01 Roff=1G Vfwd=0)",
+    }[diode_model_name]
+
+    # Sensible transient stop: 10 periods
+    try:
+        num_freq = float(re.match(r"[0-9.eE+\-]+", freq).group())
+        if freq.endswith("k") or freq.endswith("K"):
+            num_freq *= 1e3
+        stop = 10 / num_freq
+    except Exception:
+        stop = 200e-3
+
+    tran_cmd = build_tran_cmd(stop)
+
+    # ── Step 1a: Build .cir netlist ──────────────────────────────
+    lines = [
+        netlist_header("Half-Wave Rectifier"),
+        f"V1 Vin 0 SINE(0 {va} {freq})",
+        f"D1 Vin Vout {diode_model_name}",
+        f"RL Vout 0 {rl}",
+        f"",
+        model_lines,
+        tran_cmd,
+        netlist_footer(),
+    ]
+
+    # ── Step 1b: Build .asc schematic ────────────────────────────
+    asc = make_asc_half_wave_rectifier(va, freq, rl, diode_model_name, tran_cmd)
+
+    return "half_wave_rectifier", "\n".join(lines), asc
+
+
+def make_asc_half_wave_rectifier(va: str, freq: str, rl: str,
+                                  diode_model: str, tran_cmd: str) -> str:
+    """
+    Half-Wave Rectifier schematic.
+    V1(R180, x=16) → D1 (horizontal, anode=Vin bus, cathode=Vout) → RL (shunt).
+
+    Layout:
+      V1  R180 at (16, 208)   : Vin pin (16,128), GND pin (16,272)
+      D1  R90  at (80, 112)   : anode=(16,128), cathode=(208,128)
+      RL  R0   at (192, 176)  : top=(208,128),  bottom=(208,272)
+    """
+    return (
+        "Version 4\nSHEET 1 560 460\n"
+        # Horizontal bus Vin → D1 → RL
+        "WIRE 96 128 16 128\n"    # Vin → D1 anode
+        "WIRE 208 128 96 128\n"   # D1 cathode → RL top
+        # RL shunt leads
+        "WIRE 208 176 208 128\n"  # RL top lead
+        "WIRE 208 272 208 240\n"  # RL bottom lead
+        + _V1_WIRES
+        + "FLAG 208 272 0\n"       # GND at RL bottom
+        "FLAG 208 128 Vout\n"      # Vout net label
+        + _v1_sine(va, freq)
+        # D1: diode R90 → anode on left, cathode on right
+        + "SYMBOL diode 96 112 R90\n"
+        "WINDOW 0 0 32 VBottom 2\n"
+        "WINDOW 3 32 32 VTop 2\n"
+        "SYMATTR InstName D1\n"
+        f"SYMATTR Value {diode_model}\n"
+        # RL: shunt resistor R0
+        "SYMBOL res 192 176 R0\n"
+        "WINDOW 0 38 -25 Left 2\n"
+        "WINDOW 3 38 50 Left 2\n"
+        "SYMATTR InstName RL\n"
+        f"SYMATTR Value {rl}\n"
+        f"TEXT -4 304 Left 2 !{tran_cmd}\n"
+        "TEXT -4 328 Left 2 !.backanno\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. FAULT INJECTION
+#    Allow the user to deliberately corrupt a component value to simulate
+#    a faulty circuit (useful for ML dataset generation).
+# ---------------------------------------------------------------------------
+
+def _apply_fault_to_asc(asc: str, comp: str, new_val: str) -> str:
+    """Replace a component's SYMATTR Value in an .asc schematic string."""
+    if not asc:
+        return asc
+    pattern = re.compile(
+        rf"(SYMATTR InstName {re.escape(comp)}\n)(SYMATTR Value )(\S+)",
+        re.MULTILINE,
+    )
+    new_asc, _ = pattern.subn(lambda m: m.group(1) + m.group(2) + new_val, asc)
+    return new_asc
+
+
+def inject_fault(netlist: str, asc: str = "") -> tuple[str, str]:
+    """
+    Interactively inject a fault into both the netlist (.cir) and schematic
+    (.asc) by replacing one component value with a broken value.
+
+    Returns (modified_netlist, modified_asc).
+    """
+    print("\n  ── Fault Injection (for ML dataset) ──")
+    fault_types = [
+        "No fault (healthy circuit)",
+        "Open circuit  (replace one component with 1G value)",
+        "Short circuit (replace one component with 1n value)",
+        "Changed value (enter component name + new value)",
+    ]
+    choice = prompt_choice("Select fault type:", fault_types, default=1)
+
+    if choice == fault_types[0]:
+        return netlist, asc   # unchanged
+
+    comp = input("  Component reference to modify (e.g. R1, C1, L1): ").strip()
+    if not comp:
+        print("  [!] No component given - skipping fault injection.")
+        return netlist, asc
+
+    if choice == fault_types[1]:
+        new_val = "1G"   # open circuit approximation
+    elif choice == fault_types[2]:
+        new_val = "1n"   # short circuit approximation
+    else:
+        new_val = prompt_value(f"New value for {comp}", default="100k")
+
+    # ── Patch netlist (.cir) ──────────────────────────────────────
+    pattern = re.compile(
+        rf"^({re.escape(comp)}\s+\S+\s+\S+\s+)(\S+)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    new_netlist, count = pattern.subn(lambda m: m.group(1) + new_val, netlist)
+    if count == 0:
+        print(f"  [!] Component '{comp}' not found in netlist - no fault injected.")
+        return netlist, asc
+
+    new_netlist = new_netlist.replace(
+        "* Generated by LTspice Circuit Generator",
+        f"* Generated by LTspice Circuit Generator\n* FAULT: {comp} changed to {new_val}",
+    )
+
+    # ── Patch schematic (.asc) ────────────────────────────────────
+    new_asc = _apply_fault_to_asc(asc, comp, new_val)
+
+    print(f"  [OK] Fault injected: {comp} -> {new_val}")
+    return new_netlist, new_asc
+
+
+# ---------------------------------------------------------------------------
+# 6. SAVE FILE
+# ---------------------------------------------------------------------------
+
+def _safe_output_dir(output_dir: Optional[Path]) -> Path:
+    """Resolve output directory, raising ValueError if path is an existing file."""
+    if output_dir is None:
+        output_dir = Path.cwd()
+    if output_dir.exists() and not output_dir.is_dir():
+        raise ValueError(f"Path is a file, not a directory: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def save_netlist(name: str, netlist: str, output_dir: Path = None) -> Path:
+    """Save the netlist string to a .cir file and return the Path."""
+    output_dir = _safe_output_dir(output_dir)
+
+    filepath = output_dir / f"{name}.cir"
+    # If file already exists, add a numeric suffix to avoid overwriting
+    counter = 1
+    while filepath.exists():
+        filepath = output_dir / f"{name}_{counter}.cir"
+        counter += 1
+
+    filepath.write_text(netlist, encoding="utf-8")
+    return filepath
+
+
+# ---------------------------------------------------------------------------
+# 7. OPEN IN LTSPICE (optional)
+# ---------------------------------------------------------------------------
+
+# Common LTspice install paths on Windows
+# Per-user installs (LTspice 24+) live under %LOCALAPPDATA%
+_LOCAL = os.environ.get("LOCALAPPDATA", "")
+_LTSPICE_PATHS = [
+    # LTspice 24 – per-user install (most common on Win 10/11)
+    os.path.join(_LOCAL, "Programs", "ADI", "LTspice", "LTspice.exe"),
+    os.path.join(_LOCAL, "ADI", "LTspice", "LTspice.exe"),
+    # System-wide installs
+    r"C:\Program Files\ADI\LTspice\LTspice.exe",
+    r"C:\Program Files (x86)\ADI\LTspice\LTspice.exe",
+    r"C:\Program Files\LTC\LTspiceXVII\XVIIx64.exe",
+    r"C:\Program Files\LTC\LTspiceXVII\XVIIx86.exe",
+    r"C:\Program Files (x86)\LTC\LTspiceXVII\XVIIx64.exe",
+]
+
+
+def find_ltspice() -> Optional[str]:
+    """Return the path to the LTspice executable, or None if not found."""
+    for path in _LTSPICE_PATHS:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def _launch(exe_or_lnk: str, circuit_file: Path) -> None:
+    """
+    Launch LTspice with the given circuit file.
+    - If exe_or_lnk ends with .lnk (a Windows shortcut) or is not an .exe,
+      use os.startfile() / ShellExecute so Windows resolves it properly.
+    - Otherwise use subprocess.Popen for direct execution.
+    """
+    ext = os.path.splitext(exe_or_lnk)[1].lower()
+    if ext in (".lnk", "") or not os.path.isfile(exe_or_lnk):
+        # ShellExecute can open .lnk files and handles UAC automatically
+        import ctypes
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "open", exe_or_lnk, str(circuit_file), None, 1
+        )
+    else:
+        subprocess.Popen([exe_or_lnk, str(circuit_file)])
+
+
+def open_in_ltspice(circuit_file: Path) -> None:
+    """Attempt to open the .cir file in LTspice."""
+    ltspice = find_ltspice()
+    if ltspice is None:
+        print("  [!] LTspice not found in standard locations.")
+        print("  Tip: provide the path to LTspice.exe (not the .lnk shortcut).")
+        custom = input("  Enter path to LTspice.exe (or press Enter to skip): ").strip().strip('"')
+        if not custom:
+            return
+        ltspice = custom
+
+    try:
+        _launch(ltspice, circuit_file)
+        print(f"  [OK] Opened '{circuit_file.name}' in LTspice.")
+    except Exception as exc:
+        print(f"  [ERR] Failed to open LTspice: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# 8. CIRCUIT REGISTRY
+#    Maps display name → builder function.
+#    To add a new circuit: add an entry here and write a builder above.
+# ---------------------------------------------------------------------------
+
+CIRCUIT_BUILDERS: dict[str, Callable] = {
+    "RC Low-Pass Filter":     build_rc_lowpass,
+    "RC High-Pass Filter":    build_rc_highpass,
+    "RLC Band-Pass Filter":   build_rlc_bandpass,
+    "RLC Band-Stop Filter":   build_rlc_bandstop,
+    "Voltage Divider":        build_voltage_divider,
+    "Series RLC Circuit":       build_series_rlc,
+    "Parallel RLC Circuit":     build_parallel_rlc,
+    "Half-Wave Rectifier":      build_half_wave_rectifier,   # ← STEP 3: register here
+    "Custom Circuit":           build_custom,
+}
+
+
+# ---------------------------------------------------------------------------
+# 9. MAIN PROGRAM FLOW
+# ---------------------------------------------------------------------------
+
+def banner() -> None:
+    print("=" * 60)
+    print("   LTspice Circuit Netlist Generator")
+    print("   For simulation & ML fault-dataset creation")
+    print("=" * 60)
+
+
+def main() -> None:
+    banner()
+
+    # ── Step 1: Choose circuit type ──────────────────────────────
+    circuit_names = list(CIRCUIT_BUILDERS.keys())
+    chosen = prompt_choice("Select circuit type:", circuit_names, default=1)
+    builder = CIRCUIT_BUILDERS[chosen]
+
+    # ── Step 2: Collect parameters and build netlist ─────────────
+    print(f"\n{'─'*60}")
+    print(f"  Configuring: {chosen}")
+    print(f"{'─'*60}")
+    file_name, netlist, asc = builder()
+
+    # ── Step 3: Optional fault injection ─────────────────────────
+    print(f"\n{'─'*60}")
+    inject = input("  Inject a fault? (y/N): ").strip().lower()
+    if inject in ("y", "yes"):
+        netlist, asc = inject_fault(netlist, asc)
+        file_name += "_fault"
+
+    # ── Step 4: Preview ──────────────────────────────────────────
+    print(f"\n{'─'*60}")
+    print("  Netlist preview:")
+    print(f"{'─'*60}")
+    for line in netlist.splitlines():
+        print(f"    {line}")
+
+    # ── Step 5: Save ─────────────────────────────────────────────
+    print(f"\n{'─'*60}")
+    while True:
+        out_dir_raw = input(
+            f"  Output directory [default: {Path.cwd()}]: "
+        ).strip().strip('"')
+        out_dir = Path(out_dir_raw) if out_dir_raw else Path.cwd()
+        try:
+            out_dir = _safe_output_dir(Path(out_dir_raw) if out_dir_raw else None)
+        except ValueError as e:
+            print(f"  [!] {e}")
+            print("  [!] Please enter a folder path, not a file path. Try again.")
+            continue
+
+        saved_cir = save_netlist(file_name, netlist, out_dir)
+        print(f"  [OK] .cir saved: {saved_cir}")
+
+        saved_asc: Optional[Path] = None
+        if asc:
+            # Also save same-named .asc alongside the .cir
+            asc_path = out_dir / f"{saved_cir.stem}.asc"
+            counter = 1
+            while asc_path.exists():
+                asc_path = out_dir / f"{saved_cir.stem}_{counter}.asc"
+                counter += 1
+            asc_path.write_text(asc, encoding="utf-8")
+            saved_asc = asc_path
+            print(f"  [OK] .asc saved: {saved_asc}")
+        break
+
+    # ── Step 6: Open in LTspice ───────────────────────────────────
+    print(f"\n{'─'*60}")
+    open_lt = input("  Open in LTspice now? (y/N): ").strip().lower()
+    if open_lt in ("y", "yes"):
+        # Prefer .asc (schematic view) over .cir (text netlist)
+        open_in_ltspice(saved_asc if saved_asc else saved_cir)
+
+    # ── Step 7: Generate another? ────────────────────────────────
+    print(f"\n{'─'*60}")
+    again = input("  Generate another circuit? (y/N): ").strip().lower()
+    if again in ("y", "yes"):
+        print()
+        main()
+    else:
+        print("\n  Done! Happy simulating!\n")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n  Interrupted. Goodbye!")
+        sys.exit(0)
